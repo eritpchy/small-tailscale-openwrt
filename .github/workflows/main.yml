@@ -6,331 +6,183 @@ on:
   workflow_dispatch:
     inputs:
       versions:
-        description: 'Tailscale versions (e.g. 1.76.1-1.78.0,1.79.2 — leave empty for latest)'
+        description: 'Tailscale versions (e.g. 1.102.4 or 1.100.0-1.102.4; empty for latest stable)'
         required: false
+        type: string
+      platforms:
+        description: 'Space-separated Go architectures; MT7621 uses mipsle'
+        required: false
+        default: 'amd64 386 arm arm64 mips mipsle mips64 mips64le'
+        type: string
   watch:
     types: [started]
 
 permissions:
   contents: write
 
+concurrency:
+  group: tailscale-release
+  cancel-in-progress: false
+
 env:
-  REPO_OFFICIAL: 'tailscale/tailscale'
-  BUILD_PLATFORMS: 'amd64 386 arm arm64 mips mipsle mips64 mips64le'
-  GO_BUILD_FLAGS: "-tags ts_include_cli -ldflags='-s -w'"
+  REPO_OFFICIAL: tailscale/tailscale
+  BUILD_PLATFORMS: ${{ inputs.platforms || 'amd64 386 arm arm64 mips mipsle mips64 mips64le' }}
+  GO_BUILD_TAGS: ts_include_cli,ts_omit_aws,ts_omit_bird,ts_omit_completion,ts_omit_kube,ts_omit_systray,ts_omit_taildrop,ts_omit_tap,ts_omit_tpm,ts_omit_capture,ts_omit_syspolicy,ts_omit_debugeventbus,ts_omit_webclient,ts_omit_clientupdate,ts_omit_linuxdnsfight
 
 jobs:
   prepare_versions:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set_matrix.outputs.matrix }}
+      matrix: ${{ steps.versions.outputs.matrix }}
     steps:
-      - name: Fetch all releases from tailscale official repo
-        id: fetch_releases
+      - name: Select unreleased stable versions
+        id: versions
+        env:
+          VERSION_INPUT: ${{ inputs.versions }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          curl -s "https://api.github.com/repos/${{ env.REPO_OFFICIAL }}/releases?per_page=1000" | \
-            jq -r '.[].tag_name' | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' > all_releases.txt
+          python3 - <<'PYTHON'
+          import json, os, re, urllib.request
 
-      - name: Parse user input and build matrix
-        id: set_matrix
-        run: |
-          echo "===> 输入参数: ${{ github.event.inputs.versions }}"
-          input="${{ github.event.inputs.versions }}"
+          def releases(repo):
+              result = []
+              for page in range(1, 11):
+                  request = urllib.request.Request(
+                      f'https://api.github.com/repos/{repo}/releases?per_page=100&page={page}',
+                      headers={'Authorization': f'Bearer {os.environ["GH_TOKEN"]}',
+                               'Accept': 'application/vnd.github+json'})
+                  with urllib.request.urlopen(request) as response:
+                      batch = json.load(response)
+                  result.extend(batch)
+                  if len(batch) < 100:
+                      break
+              return result
 
-          # 获取本地仓库已有 release 列表
-          existing_releases=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases" | jq -r '.[].tag_name' | sed 's/^v//')
-          echo "===> 本地已有 release: "
-          echo "$existing_releases"
-          echo "====> 开始处理版本范围"
+          def version(tag):
+              return tuple(map(int, tag.removeprefix('v').split('.')))
 
-          declare -A versions
-
-          if [ -z "$input" ]; then
-            # 未提供输入，默认取最新 tag
-            tag=$(head -n1 all_releases.txt)
-            tag=${tag#v}  # 去除前缀 v
-            if echo "$existing_releases" | grep -qx "$tag"; then
-              echo "release $tag 已存在"
-              echo 'matrix=["skip"]' >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            echo "未提供输入，默认取第一个 release: $tag"
-            echo "matrix=$(jq -cn --arg v "$tag" '[ $v ]')" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "===> 开始解析版本范围：$input"
-
-          IFS=',' read -ra parts <<< "$input"
-          for part in "${parts[@]}"; do
-            if [[ "$part" == *"-"* ]]; then
-              start=${part%-*}
-              end=${part#*-}
-              echo "  发现范围: $start 到 $end"
-              matched=$(sed 's/^v//' all_releases.txt | sort -V | awk -v s="$start" -v e="$end" '$0 >= s && $0 <= e')
-              echo "    匹配结果：$(echo "$matched" | xargs)"
-              for v in $matched; do
-                # 跳过已有 release
-                if echo "$existing_releases" | grep -qx "$v"; then
-                  echo "    跳过已有 release: $v"
-                  continue
-                fi
-                versions["v$v"]=1
-              done
-            else
-              echo "  发现单一版本: $part"
-              if echo "$existing_releases" | grep -qx "$part"; then
-                echo "    跳过已有 release: $part"
-                continue
-              fi
-              versions["v$part"]=1
-            fi
-          done
-
-          echo "===> 收集到版本（未排序）:"
-          for v in "${!versions[@]}"; do
-            echo "  - $v"
-          done
-
-          all_versions_sorted=$(for v in "${!versions[@]}"; do echo "$v" | sed 's/^v//'; done | sort -V)
-          echo "===> 排序后版本:"
-          echo "$all_versions_sorted"
-
-          # 如果排序后的版本为空，写入占位 skip
-          if [ -z "$all_versions_sorted" ]; then
-            echo "===> 没有可用版本，生成占位 skip"
-            jq_array=$(jq -cn --arg v skip '[ $v ]')
-          else
-            jq_array=$(printf '%s\n' $all_versions_sorted | jq -R . | jq -s .)
-          fi
-
-          echo "===> 生成 matrix:"
-          echo "$jq_array" | jq -c
-          echo "matrix=$(echo "$jq_array" | jq -c)" >> "$GITHUB_OUTPUT"
-          echo "====> 结束处理版本范围"
-
+          official = [r['tag_name'].removeprefix('v') for r in releases(os.environ['REPO_OFFICIAL'])
+                      if not r['draft'] and not r['prerelease']
+                      and re.fullmatch(r'v?\d+\.\d+\.\d+', r['tag_name'])]
+          if not official:
+              raise SystemExit('No official stable releases found')
+          existing = {r['tag_name'].removeprefix('v') for r in releases(os.environ['GITHUB_REPOSITORY'])}
+          requested = os.environ.get('VERSION_INPUT', '').strip()
+          selected = set()
+          if not requested:
+              selected.add(max(official, key=version))
+          else:
+              for part in requested.split(','):
+                  part = part.strip()
+                  if not re.fullmatch(r'v?\d+\.\d+\.\d+(?:-v?\d+\.\d+\.\d+)?', part):
+                      raise SystemExit(f'Invalid version input: {part}')
+                  if '-' in part:
+                      start, end = map(version, part.split('-'))
+                      if start > end:
+                          raise SystemExit(f'Invalid version range: {part}')
+                      selected.update(v for v in official if start <= version(v) <= end)
+                  else:
+                      selected.add(part.removeprefix('v'))
+          unknown = selected.difference(official)
+          if unknown:
+              raise SystemExit(f'Not official stable releases: {sorted(unknown)}')
+          matrix = sorted(selected.difference(existing), key=version) or ['skip']
+          print(f'Selected versions: {matrix}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'matrix={json.dumps(matrix)}\n')
+          PYTHON
 
   build_and_release:
     needs: prepare_versions
+    if: needs.prepare_versions.outputs.matrix != '["skip"]'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       matrix:
         version: ${{ fromJson(needs.prepare_versions.outputs.matrix) }}
-      fail-fast: true
-      max-parallel: 16
+      max-parallel: 1
     env:
       TAG: v${{ matrix.version }}
     steps:
-      - name: Exit if placeholder
-        run: |
-          if [ "${TAG}" = "vskip" ]; then
-            echo "No versions to build. Exiting."
-            echo "skip=true" >> $GITHUB_ENV
-            exit 0
-          else
-            echo "skip=false" >> $GITHUB_ENV
-          fi
-
-      - name: Check if release exists
-        id: check_release
-        if: env.skip != 'true'
-        run: |
-          REPO="${{ github.repository }}"
-          TAG="v${{ matrix.version }}"
-          TOKEN="${{ secrets.GITHUB_TOKEN }}"
-
-          # 查询 Release
-          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: token $TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/releases/tags/$TAG")
-
-          if [ "$RESPONSE" -eq 200 ]; then
-            echo "Release $TAG already exists"
-            echo "skip=true" >> $GITHUB_ENV
-          else
-            echo "Release $TAG does not exist"
-            echo "skip=false" >> $GITHUB_ENV
-          fi
-
-      - name: Checkout Tailscale source
+      - name: Checkout official Tailscale source
         uses: actions/checkout@v4
-        if: env.skip != 'true'
         with:
           repository: ${{ env.REPO_OFFICIAL }}
           ref: ${{ env.TAG }}
 
-      - name: Setup Go environment
+      - name: Setup Go
         uses: actions/setup-go@v5
-        if: env.skip != 'true'
         with:
-          go-version: 'stable'
+          go-version: '1.27.1'
+          cache: true
 
-      - name: Install latest UPX
-        if: env.skip != 'true'
+      - name: Build Smaller Tailscale as ordinary ELF binaries
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOTOOLCHAIN: local
         run: |
-          set -e
-          LATEST_UPX=$(curl -s https://api.github.com/repos/upx/upx/releases/latest | grep -oP '"tag_name": "v\K[0-9.]+' | head -n1)
-          echo "Latest UPX version: $LATEST_UPX"
-          curl -LO "https://github.com/upx/upx/releases/download/v${LATEST_UPX}/upx-${LATEST_UPX}-amd64_linux.tar.xz"
-          tar -xf "upx-${LATEST_UPX}-amd64_linux.tar.xz"
-          sudo cp "upx-${LATEST_UPX}-amd64_linux/upx" /usr/local/bin/
-          upx --version
-
-      - name: Build optimized binaries
-        if: env.skip != 'true'
-        run: |
-          echo "${{ env.TAG }}" > version.txt
-          mkdir -p ./build
-          for arch in ${{ env.BUILD_PLATFORMS }}; do
-            echo "Building for $arch..."
-            binary_name="./build/tailscaled-linux-${arch}.build"
-
-            export CGO_ENABLED=0
-            export GOOS=linux
-            export GOARCH=$arch
-
+          set -euo pipefail
+          mkdir -p build
+          printf '%s\n' "$TAG" > build/version.txt
+          source_commit=$(git rev-parse HEAD)
+          for arch in $BUILD_PLATFORMS; do
             case "$arch" in
-              mips|mipsle)
-                export GOMIPS=softfloat
-                ;;
+              amd64|386|arm|arm64|mips|mipsle|mips64|mips64le) ;;
+              *) echo "Unsupported architecture: $arch" >&2; exit 1 ;;
             esac
-
-            go build -o "$binary_name" ${{ env.GO_BUILD_FLAGS }} ./cmd/tailscaled
-
-            if [ ! -f "$binary_name" ]; then
-              echo "❌  编译失败: $binary_name 不存在"
+            export GOARCH="$arch"
+            unset GOMIPS GOMIPS64
+            case "$arch" in
+              mips|mipsle) export GOMIPS=softfloat ;;
+              mips64|mips64le) export GOMIPS64=softfloat ;;
+            esac
+            binary="build/tailscaled-linux-${arch}"
+            go list -deps -tags "$GO_BUILD_TAGS" ./cmd/tailscaled > "build/dependencies-${arch}.txt"
+            if grep -qx 'tailscale.com/feature/linuxdnsfight' "build/dependencies-${arch}.txt"; then
+              echo 'Recursive /etc DNS monitoring must be omitted' >&2
               exit 1
             fi
+            grep -qx 'tailscale.com/net/dns' "build/dependencies-${arch}.txt"
+            grep -qx 'tailscale.com/feature/ssh' "build/dependencies-${arch}.txt"
+            go build -trimpath -buildvcs=false -tags "$GO_BUILD_TAGS" \
+              -ldflags "-s -w -X tailscale.com/version.longStamp=${TAG#v}-wulu-r10 -X tailscale.com/version.shortStamp=${TAG#v}" \
+              -o "$binary" ./cmd/tailscaled
+            go version -m "$binary"
+            file "$binary"
+            jq -n --arg version "${TAG#v}" --arg source "$source_commit" \
+              --arg workflow "$GITHUB_SHA" --arg go "$(go env GOVERSION)" \
+              --arg arch "$arch" --arg tags "$GO_BUILD_TAGS" \
+              --arg gomips "${GOMIPS:-${GOMIPS64:-}}" --arg sha "$(sha256sum "$binary" | cut -d' ' -f1)" \
+              '{version: $version, source_commit: $source, workflow_commit: $workflow,
+                go: $go, goos: "linux", goarch: $arch, gomips: $gomips, cgo: false,
+                tags: ($tags | split(",")), upx: false, sha256: $sha}' \
+              > "build/build-info-${arch}.json"
           done
+          (cd build && sha256sum tailscaled-linux-* build-info-*.json version.txt > SHA256SUMS.txt)
 
-      - name: Compress binaries
-        if: env.skip != 'true'
-        run: |
-          mkdir -p ./upx_compress
-          for arch in ${{ env.BUILD_PLATFORMS }}; do
-            binary_name="./build/tailscaled-linux-${arch}.build"
-            compressed_name="./upx_compress/tailscaled-linux-${arch}"
-
-            case "$arch" in
-              mips64|mips64le)
-                echo "⚠️  跳过 $arch 的 UPX 压缩"
-                cp "$binary_name" "$compressed_name"
-                ;;
-              *)
-                if [[ -f "$binary_name" ]]; then
-                  upx --lzma --best --no-progress "$binary_name" -o "$compressed_name"
-                else
-                  echo "❌  编译失败: $binary_name 不存在"
-                fi
-                ;;
-            esac
-          done
-
-      - name: Generate checksums
-        if: env.skip != 'true'
-        run: |
-          sha256sum ./build/tailscaled-* > SHA256SUMS.txt
-          md5sum ./build/tailscaled-* > MD5SUMS.txt
-          sha256sum ./upx_compress/tailscaled-* >> SHA256SUMS.txt
-          md5sum ./upx_compress/tailscaled-* >> MD5SUMS.txt
-
-          sed -i 's|./build/||g' SHA256SUMS.txt
-          sed -i 's|./build/||g' MD5SUMS.txt
-          sed -i 's|./upx_compress/||g' SHA256SUMS.txt
-          sed -i 's|./upx_compress/||g' MD5SUMS.txt
-          sed -i 's/  */ /g' SHA256SUMS.txt
-          sed -i 's/  */ /g' MD5SUMS.txt
-
-          cat SHA256SUMS.txt
-          cat MD5SUMS.txt
-
-      - name: Wait previous version release
-        if: env.skip != 'true'
-        run: |
-          # echo "=== 当前 Matrix 版本列表 ==="
-          # echo '${{ needs.prepare_versions.outputs.matrix }}' | jq -r '.[]'
-
-          # 解析 matrix 为 bash 数组
-          readarray -t matrix_versions < <(echo '${{ needs.prepare_versions.outputs.matrix }}' | jq -r '.[]')
-
-          # 找出当前版本在 matrix 中的前一个版本
-          prev_version=""
-          for i in "${!matrix_versions[@]}"; do
-            if [ "${matrix_versions[$i]}" == "${{ matrix.version }}" ]; then
-              if [ $i -gt 0 ]; then
-                prev_version="${matrix_versions[$i-1]}"
-              fi
-              break
-            fi
-          done
-
-          if [ -z "$prev_version" ]; then
-            echo "当前版本是最早版本，无需等待，直接发布 ${{ matrix.version }}"
-            exit 0
-          fi
-
-          echo "当前版本之前的 Matrix 版本: $prev_version"
-
-          # 循环等待，直到该版本 release 已存在
-          until curl -s -f "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/v$prev_version" >/dev/null 2>&1; do
-            echo "⏳ 等待前一个版本 v$prev_version 的 release 创建..."
-            sleep 5
-          done
-
-          echo "✅ 前一个版本 v$prev_version 的 release 已存在 — 可以发布当前版本 ${{ matrix.version }}"
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        if: env.skip != 'true'
+      - name: Create release
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
-          name: 'Tailscale ${{ env.TAG }}'
+          name: 'Smaller Tailscale ${{ env.TAG }}'
+          target_commitish: ${{ github.sha }}
           body: |
-            ## 🚀 Tailscale ${{ env.TAG }} UPX压缩版发布
+            Smaller Tailscale built from the official source with Go 1.27.1.
 
-            [![Downloads](https://img.shields.io/github/downloads/CH3NGYZ/small-tailscale-openwrt/${{ env.TAG }}/total)](https://github.com/CH3NGYZ/small-tailscale-openwrt/releases/${{ env.TAG }})
+            - Ordinary stripped ELF binaries, without UPX. OpenWrt firmware can compress them with SquashFS.
+            - Combined CLI and daemon; create a `tailscale` symlink to the binary for CLI use.
+            - Retains Tailscale SSH, DNS configuration, subnet routing, exit nodes, and Peer Relay.
+            - Omits AWS, BIRD, completion, Kubernetes, systray, Taildrop, TAP, TPM, capture, syspolicy, debug event bus, web client, and client update.
+            - Omits recursive Linux DNS conflict monitoring (`ts_omit_linuxdnsfight`) to avoid processing every `/etc` access on OpenWrt. DNS configuration is retained; automatic repair of external resolv.conf changes is unavailable.
+            - MT7621 uses `tailscaled-linux-mipsle`: 32-bit little-endian MIPS, software floating point, CGO disabled.
 
-            🧩 **支持架构**：
-            `${{ env.BUILD_PLATFORMS }}`
-
-            ⚙️  **内容说明**：
-            - 每个架构只生成一个联合二进制文件，通过改名即可分别作为`tailscale`（前台程序）和`tailscaled`（后台程序）运行。
-            - *注意：由于 UPX[目前不支持, 也没有计划支持](https://github.com/upx/upx/issues/272#issuecomment-1250010942)`mips64`与`mips64le`架构, 此release中这两个架构的可执行文件为`未压缩`的状态*
-
-            📄 **校验方式**：
-            把 tailscale-linux-* 和校验文件放在同一个目录下，执行：
-            ```bash
-            sha256sum -c SHA256SUMS.txt
-            md5sum -c MD5SUMS.txt
-            ```
-
-            🔧  **快速启动**：
-            ```bash
-            chmod +x /path/to/tailscaled-linux-amd64
-            ln -s /path/to/tailscaled-linux-amd64 /usr/bin/tailscale
-            ln -s /path/to/tailscaled-linux-amd64 /usr/bin/tailscaled
-            tailscaled & # 服务进程需后台运行
-            tailscale up # 等待服务进程运行几秒之后再运行(等待服务进程与tailscale服务器连接)
-            ```
-
-            📦 **附带文件**：
-            | 文件名               | 说明                  |
-            |----------------------|-----------------------|
-            | tailscaled-linux-ARCH    | 不同架构已压缩的可执行文件 |
-            | tailscaled-linux-ARCH.build | 不同架构未压缩的可执行文件 |
-            | SHA256SUMS.txt        | SHA256 校验文件        |
-            | MD5SUMS.txt           | MD5 校验文件           |
-            | version.txt           | 当前版本          |
-
-            📜 **更新日志**：
-            [点此查看](https://tailscale.com/changelog)
-
+            Build metadata and SHA256SUMS accompany the binaries. Verify with `sha256sum -c SHA256SUMS.txt`.
           draft: false
           prerelease: false
+          fail_on_unmatched_files: true
           files: |
-            ./build/tailscaled-*
-            ./upx_compress/tailscaled-*
-            version.txt
-            SHA256SUMS.txt
-            MD5SUMS.txt
+            build/tailscaled-linux-*
+            build/build-info-*.json
+            build/version.txt
+            build/SHA256SUMS.txt
