@@ -111,9 +111,10 @@ jobs:
           ref: ${{ env.TAG }}
 
       - name: Setup Go
+        id: go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.27.1'
+          go-version-file: go.mod
           cache: true
 
       - name: Build Smaller Tailscale as ordinary ELF binaries
@@ -168,7 +169,7 @@ jobs:
           name: 'Smaller Tailscale ${{ env.TAG }}'
           target_commitish: ${{ github.sha }}
           body: |
-            Smaller Tailscale built from the official source with Go 1.27.1.
+            Smaller Tailscale built from the official source with Go ${{ steps.go.outputs.go-version }}.
 
             - Ordinary stripped ELF binaries, without UPX. OpenWrt firmware can compress them with SquashFS.
             - Combined CLI and daemon; create a `tailscale` symlink to the binary for CLI use.
