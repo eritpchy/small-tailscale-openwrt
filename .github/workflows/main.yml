@@ -14,6 +14,10 @@ on:
         required: false
         default: 'amd64 386 arm arm64 mips mipsle mips64 mips64le'
         type: string
+      revisioned:
+        description: 'Stage a draft WuLu revision of an existing release under a separate tag'
+        type: boolean
+        default: false
   watch:
     types: [started]
 
@@ -27,7 +31,8 @@ concurrency:
 env:
   REPO_OFFICIAL: tailscale/tailscale
   BUILD_PLATFORMS: ${{ inputs.platforms || 'amd64 386 arm arm64 mips mipsle mips64 mips64le' }}
-  GO_BUILD_TAGS: ts_include_cli,ts_omit_aws,ts_omit_bird,ts_omit_completion,ts_omit_kube,ts_omit_systray,ts_omit_taildrop,ts_omit_tap,ts_omit_tpm,ts_omit_capture,ts_omit_syspolicy,ts_omit_debugeventbus,ts_omit_webclient,ts_omit_clientupdate,ts_omit_linuxdnsfight
+  WULU_BUILD_REVISION: wulu-r11
+  GO_BUILD_TAGS: ts_include_cli,ts_omit_aws,ts_omit_bird,ts_omit_completion,ts_omit_kube,ts_omit_systray,ts_omit_taildrop,ts_omit_tap,ts_omit_tpm,ts_omit_capture,ts_omit_syspolicy,ts_omit_debugeventbus,ts_omit_webclient,ts_omit_clientupdate,ts_omit_flashappliance,ts_omit_linuxdnsfight
 
 jobs:
   prepare_versions:
@@ -39,6 +44,7 @@ jobs:
         id: versions
         env:
           VERSION_INPUT: ${{ inputs.versions }}
+          REVISIONED: ${{ inputs.revisioned }}
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PYTHON'
@@ -68,6 +74,9 @@ jobs:
               raise SystemExit('No official stable releases found')
           existing = {r['tag_name'].removeprefix('v') for r in releases(os.environ['GITHUB_REPOSITORY'])}
           requested = os.environ.get('VERSION_INPUT', '').strip()
+          revisioned = os.environ.get('REVISIONED') == 'true'
+          if revisioned and not re.fullmatch(r'v?\d+\.\d+\.\d+', requested):
+              raise SystemExit('A revisioned build requires one explicit upstream version')
           selected = set()
           if not requested:
               selected.add(max(official, key=version))
@@ -86,7 +95,14 @@ jobs:
           unknown = selected.difference(official)
           if unknown:
               raise SystemExit(f'Not official stable releases: {sorted(unknown)}')
-          matrix = sorted(selected.difference(existing), key=version) or ['skip']
+          if revisioned:
+              if not selected.issubset(existing):
+                  raise SystemExit('A revisioned build requires an existing base release')
+              suffix = os.environ['WULU_BUILD_REVISION']
+              selected = {v for v in selected if f'{v}-{suffix}' not in existing}
+          else:
+              selected.difference_update(existing)
+          matrix = sorted(selected, key=version) or ['skip']
           print(f'Selected versions: {matrix}')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f'matrix={json.dumps(matrix)}\n')
@@ -144,10 +160,14 @@ jobs:
               echo 'Recursive /etc DNS monitoring must be omitted' >&2
               exit 1
             fi
+            if grep -Eq '^tailscale\.com/(feature/)?clientupdate(/|$)' "build/dependencies-${arch}.txt"; then
+              echo 'The CLI must omit client update and appliance deployment together' >&2
+              exit 1
+            fi
             grep -qx 'tailscale.com/net/dns' "build/dependencies-${arch}.txt"
             grep -qx 'tailscale.com/feature/ssh' "build/dependencies-${arch}.txt"
             go build -trimpath -buildvcs=false -tags "$GO_BUILD_TAGS" \
-              -ldflags "-s -w -X tailscale.com/version.longStamp=${TAG#v}-wulu-r10 -X tailscale.com/version.shortStamp=${TAG#v}" \
+              -ldflags "-s -w -X tailscale.com/version.longStamp=${TAG#v}-${WULU_BUILD_REVISION} -X tailscale.com/version.shortStamp=${TAG#v}" \
               -o "$binary" ./cmd/tailscaled
             go version -m "$binary"
             file "$binary"
@@ -164,9 +184,11 @@ jobs:
 
       - name: Create release
         uses: softprops/action-gh-release@v2
+        env:
+          RELEASE_TAG: ${{ inputs.revisioned && format('v{0}-{1}', matrix.version, env.WULU_BUILD_REVISION) || env.TAG }}
         with:
-          tag_name: ${{ env.TAG }}
-          name: 'Smaller Tailscale ${{ env.TAG }}'
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: 'Smaller Tailscale ${{ env.RELEASE_TAG }}'
           target_commitish: ${{ github.sha }}
           body: |
             Smaller Tailscale built from the official source with Go ${{ steps.go.outputs.go-version }}.
@@ -174,12 +196,12 @@ jobs:
             - Ordinary stripped ELF binaries, without UPX. OpenWrt firmware can compress them with SquashFS.
             - Combined CLI and daemon; create a `tailscale` symlink to the binary for CLI use.
             - Retains Tailscale SSH, DNS configuration, subnet routing, exit nodes, and Peer Relay.
-            - Omits AWS, BIRD, completion, Kubernetes, systray, Taildrop, TAP, TPM, capture, syspolicy, debug event bus, web client, and client update.
+            - Omits AWS, BIRD, completion, Kubernetes, systray, Taildrop, TAP, TPM, capture, syspolicy, debug event bus, web client, client update, and appliance deployment.
             - Omits recursive Linux DNS conflict monitoring (`ts_omit_linuxdnsfight`) to avoid processing every `/etc` access on OpenWrt. DNS configuration is retained; automatic repair of external resolv.conf changes is unavailable.
             - MT7621 uses `tailscaled-linux-mipsle`: 32-bit little-endian MIPS, software floating point, CGO disabled.
 
             Build metadata and SHA256SUMS accompany the binaries. Verify with `sha256sum -c SHA256SUMS.txt`.
-          draft: false
+          draft: ${{ inputs.revisioned || false }}
           prerelease: false
           fail_on_unmatched_files: true
           files: |
